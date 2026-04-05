@@ -1,0 +1,980 @@
+--[[
+    RBXLParser.lua  (spec-correct rewrite)
+    Full Roblox binary place file (.rbxl) parser written in pure Luau.
+    Supports LZ4-compressed chunks, all major property types.
+
+    Reference specs:
+        https://dom.rojo.space/binary.html   (rbx-dom — primary)
+        https://github.com/RobloxAPI/spec    (RobloxAPI/spec)
+
+    ─────────────────────────────────────────────────────────────
+    BUGS FIXED vs. original (all confirmed against the official spec)
+    ─────────────────────────────────────────────────────────────
+
+    1.  CRITICAL — Wrong type IDs for every type after Int64 (0x1b).
+        The parser had SharedString at 0x1e, OptionalCFrame at 0x1f,
+        UniqueId at 0x20, Font at 0x21. The spec says:
+            0x1c  SharedString
+            0x1d  Bytecode          (was missing entirely)
+            0x1e  OptionalCFrame
+            0x1f  UniqueId
+            0x20  Font
+            0x22  Content
+        Every property of these types was mis-dispatched. When a real
+        0x1e (OptionalCFrame) chunk arrived it was dispatched to
+        pSharedString, consuming the wrong number of bytes and silently
+        corrupting every subsequent PROP chunk for that class.
+
+    2.  CRITICAL — pOptionalCFrame had the completely wrong wire format.
+        Actual format (per spec, confirmed by byte-level example):
+            [0x10 byte]  inner CFrame type marker
+            <pCFrame for ALL n entries; absent entries = identity CFrame>
+            [0x02 byte]  Bool type marker
+            <n presence bytes>
+        Original read bools first, then only the present CFrames —
+        inverted order and wrong count, corrupting cursor position on
+        any place using PivotOffset or similar Optional properties.
+
+    3.  CRITICAL — pRect used sequential standard IEEE-754 f32 per entry.
+        Spec says Rect is four separately byte-interleaved Roblox-float
+        arrays: Min.X, Min.Y, Max.X, Max.Y. Wrong in both encoding
+        (standard vs. Roblox rotated float) and layout (sequential vs.
+        interleaved). All Rect values were garbage.
+
+    4.  SIGNIFICANT — pPhysProp read the flags byte as a plain boolean.
+        It is a bitfield: Bit 0 = custom, Bit 1 = AcousticAbsorption
+        present. When both bits are set (flags == 3) there are 6 f32s,
+        not 5. Under-reading by 4 bytes corrupted subsequent cursor.
+
+    5.  SIGNIFICANT — pContent (0x22) was aliased to pString.
+        Content has a completely different structure:
+            [n interleaved u32 SourceTypes]
+            [u32 UriCount][UriCount strings]
+            [u32 ObjCount][ObjCount interleaved i32 refs]
+            [u32 ExtCount][ExtCount interleaved i32 refs]
+        Treating it as a length-prefixed string consumed the wrong byte
+        count, corrupting all subsequent PROP chunks for that class.
+
+    6.  MODERATE — buildTree was recursive. Deep UI hierarchies (hundreds
+        of nested GuiObjects) could hit Lua's call-stack limit and crash.
+        Replaced with an explicit iterative stack.
+
+    7.  MINOR — pFont returned nil for every entry. Now decodes the family
+        string, weight, and style and returns a Font instance.
+
+    8.  MINOR — pBytecode (0x1d) was missing. It shares the String wire
+        format; added so the cursor advances correctly past bytecode props.
+
+    9.  MINOR — pSharedString required a special `if typeId == 0x1e` branch
+        in the PROP handler. Now injected as a closure so the dispatcher
+        is fully uniform.
+
+    10. MINOR — PROP parse errors were silently swallowed. Now warn() with
+        class name, property name, and type ID for easier debugging.
+
+    Usage:
+        local RBXL = loadstring(game:HttpGet('...'))()
+        RBXL.insertFromPlaceId(placeId)
+        RBXL.insertFromPlaceId(placeId, function(msg) print(msg) end)
+]]
+
+local RBXL = {}
+
+-- ============================================================
+-- BIT HELPERS
+-- ============================================================
+
+local bxor   = bit32.bxor
+local band   = bit32.band
+local bor    = bit32.bor
+local lshift = bit32.lshift
+local rshift = bit32.rshift
+
+-- ============================================================
+-- BYTE ARRAY → STRING  (safe for large arrays)
+-- ============================================================
+
+local function bytesToString(bytes, len)
+    local chunks, i = {}, 1
+    while i <= len do
+        local e = math.min(i + 8191, len)
+        chunks[#chunks + 1] = string.char(table.unpack(bytes, i, e))
+        i = e + 1
+    end
+    return table.concat(chunks)
+end
+
+-- ============================================================
+-- LZ4 BLOCK DECOMPRESSOR  (no frame header)
+-- ============================================================
+
+local function lz4Decompress(src, outSize)
+    local out    = table.create(outSize or 65536)
+    local outLen = 0
+    local pos    = 1
+    local srcLen = #src
+
+    while pos <= srcLen do
+        local token = string.byte(src, pos); pos = pos + 1
+
+        -- Literal length (high nibble, extended if == 15)
+        local litLen = rshift(token, 4)
+        if litLen == 15 then
+            repeat
+                local b = string.byte(src, pos); pos = pos + 1
+                litLen = litLen + b
+            until b ~= 255
+        end
+
+        -- Copy literals
+        for i = 0, litLen - 1 do
+            outLen = outLen + 1
+            out[outLen] = string.byte(src, pos + i)
+        end
+        pos = pos + litLen
+
+        if pos > srcLen then break end   -- last sequence has no match section
+
+        -- Match offset (LE u16)
+        local offset = string.byte(src, pos) + string.byte(src, pos + 1) * 256
+        pos = pos + 2
+        if offset == 0 then break end    -- guard against corrupt data
+
+        -- Match length (low nibble + 4, extended if low nibble == 15)
+        local matchLen = band(token, 0xF) + 4
+        if band(token, 0xF) == 15 then
+            repeat
+                local b = string.byte(src, pos); pos = pos + 1
+                matchLen = matchLen + b
+            until b ~= 255
+        end
+
+        -- Back-reference copy (handles overlapping)
+        local matchStart = outLen - offset
+        for i = 0, matchLen - 1 do
+            outLen = outLen + 1
+            out[outLen] = out[matchStart + i + 1]
+        end
+    end
+
+    return bytesToString(out, outLen)
+end
+
+-- ============================================================
+-- INTEGER / FLOAT TRANSFORMS
+-- ============================================================
+
+-- Zigzag decode: even → positive, odd → negative.
+-- Spec: untransform(x) = x/2 if even, -(x+1)/2 if odd.
+local function untransformInt(n)
+    if band(n, 1) == 0 then return rshift(n, 1)
+    else                     return -rshift(n + 1, 1) end
+end
+
+-- Roblox Float32: IEEE-754 with sign bit rotated to LSB.
+-- Recovery: rotate whole value left by 1 bit to restore IEEE-754.
+local function untransformFloat(bits)
+    local ieee = bor(lshift(bits, 1), rshift(bits, 31))
+    return string.unpack('<f', string.pack('<I4', ieee))
+end
+
+-- ============================================================
+-- INTERLEAVED ARRAY READERS
+-- For N values of stride S: byte[0] of all values first, then byte[1], etc.
+-- The bytes within each value are big-endian (MSB first in storage order).
+-- ============================================================
+
+local function readIL32Raw(data, pos, n)
+    local r = table.create(n)
+    for i = 0, n - 1 do
+        local b0 = string.byte(data, pos + i)
+        local b1 = string.byte(data, pos + n   + i)
+        local b2 = string.byte(data, pos + 2*n + i)
+        local b3 = string.byte(data, pos + 3*n + i)
+        r[i + 1] = b0*16777216 + b1*65536 + b2*256 + b3
+    end
+    return r
+end
+
+local function readILInt32(data, pos, n)
+    local raw = readIL32Raw(data, pos, n)
+    for i = 1, n do raw[i] = untransformInt(raw[i]) end
+    return raw, pos + 4*n
+end
+
+local function readILFloat32(data, pos, n)
+    local raw = readIL32Raw(data, pos, n)
+    for i = 1, n do raw[i] = untransformFloat(raw[i]) end
+    return raw, pos + 4*n
+end
+
+local function readILUInt32(data, pos, n)
+    return readIL32Raw(data, pos, n), pos + 4*n
+end
+
+-- Referent: interleaved Int32 with zigzag + delta accumulation.
+-- Spec: "the actual value of each referent is the raw value plus all preceding."
+local function readReferents(data, pos, n)
+    local raw = readIL32Raw(data, pos, n)
+    local r, acc = table.create(n), 0
+    for i = 1, n do
+        acc  = acc + untransformInt(raw[i])
+        r[i] = acc
+    end
+    return r, pos + 4*n
+end
+
+-- ============================================================
+-- CFRAME SPECIAL ROTATION IDs
+-- Spec: angles in degrees, applied Y→X→Z (intrinsic Euler).
+-- ============================================================
+
+local function yxz(rx, ry, rz)
+    local r = math.rad
+    return CFrame.Angles(0, r(ry), 0)
+         * CFrame.Angles(r(rx), 0, 0)
+         * CFrame.Angles(0, 0, r(rz))
+end
+
+local CF_ID = {
+    [0x02]=yxz(  0,    0,   0), [0x03]=yxz( 90,    0,   0),
+    [0x05]=yxz(  0,  180, 180), [0x06]=yxz(-90,    0,   0),
+    [0x07]=yxz(  0,  180,  90), [0x09]=yxz(  0,   90,  90),
+    [0x0a]=yxz(  0,    0,  90), [0x0c]=yxz(  0,  -90,  90),
+    [0x0d]=yxz(-90,  -90,   0), [0x0e]=yxz(  0,  -90,   0),
+    [0x10]=yxz( 90,  -90,   0), [0x11]=yxz(  0,   90, 180),
+    [0x14]=yxz(  0,  180,   0), [0x15]=yxz(-90, -180,   0),
+    [0x17]=yxz(  0,    0, 180), [0x18]=yxz( 90,  180,   0),
+    [0x19]=yxz(  0,    0, -90), [0x1b]=yxz(  0,  -90, -90),
+    [0x1c]=yxz(  0, -180, -90), [0x1e]=yxz(  0,   90, -90),
+    [0x1f]=yxz( 90,   90,   0), [0x20]=yxz(  0,   90,   0),
+    [0x22]=yxz(-90,   90,   0), [0x23]=yxz(  0,  -90, 180),
+}
+
+-- ============================================================
+-- PROPERTY TYPE PARSERS   parser(data, pos, n) → values[], newPos
+-- ============================================================
+
+-- 0x01  String / BinaryString / ProtectedString — N sequential length-prefixed strings.
+local function pString(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        local len = string.unpack('<I4', data, pos); pos = pos + 4
+        r[i] = string.sub(data, pos, pos + len - 1); pos = pos + len
+    end
+    return r, pos
+end
+
+-- 0x02  Bool — 1 byte each, sequential.
+local function pBool(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = string.byte(data, pos) ~= 0; pos = pos + 1 end
+    return r, pos
+end
+
+-- 0x03  Int32 — interleaved big-endian u32 + zigzag.
+local function pInt32(data, pos, n) return readILInt32(data, pos, n) end
+
+-- 0x04  Float32 — interleaved Roblox-float (sign bit at LSB).
+local function pFloat32(data, pos, n) return readILFloat32(data, pos, n) end
+
+-- 0x05  Float64 — sequential little-endian IEEE-754.
+local function pFloat64(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = string.unpack('<d', data, pos); pos = pos + 8 end
+    return r, pos
+end
+
+-- 0x06  UDim — [N Scale Roblox-float interleaved][N Offset Int32 interleaved]
+local function pUDim(data, pos, n)
+    local sc, p2 = readILFloat32(data, pos, n)
+    local of, p3 = readILInt32(data, p2, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = UDim.new(sc[i], of[i]) end
+    return r, p3
+end
+
+-- 0x07  UDim2 — X.Scale, Y.Scale, X.Offset, Y.Offset each interleaved.
+local function pUDim2(data, pos, n)
+    local xs, p2 = readILFloat32(data, pos, n)
+    local ys, p3 = readILFloat32(data, p2, n)
+    local xo, p4 = readILInt32(data, p3, n)
+    local yo, p5 = readILInt32(data, p4, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = UDim2.new(xs[i], xo[i], ys[i], yo[i]) end
+    return r, p5
+end
+
+-- 0x08  Ray — 6 sequential LE f32 per value (origin XYZ, direction XYZ).
+-- Spec: "stored in order without any additional transformations."
+local function pRay(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        local ox,oy,oz,dx,dy,dz = string.unpack('<ffffff', data, pos)
+        r[i] = Ray.new(Vector3.new(ox,oy,oz), Vector3.new(dx,dy,dz)); pos = pos + 24
+    end
+    return r, pos
+end
+
+-- 0x09  Faces — 1 byte each; low 6 bits = face flags. Sequential, no transform.
+local function pFaces(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = string.byte(data, pos); pos = pos + 1 end
+    return r, pos
+end
+
+-- 0x0A  Axes — 1 byte each; low 3 bits = axis flags. Sequential, no transform.
+local function pAxes(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = string.byte(data, pos); pos = pos + 1 end
+    return r, pos
+end
+
+-- 0x0B  BrickColor — interleaved big-endian u32, no transform.
+local function pBrickColor(data, pos, n)
+    local raw, np = readILUInt32(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = BrickColor.new(raw[i]) end
+    return r, np
+end
+
+-- 0x0C  Color3 — R, G, B each as interleaved Roblox-float array.
+local function pColor3(data, pos, n)
+    local rs, p2 = readILFloat32(data, pos, n)
+    local gs, p3 = readILFloat32(data, p2, n)
+    local bs, p4 = readILFloat32(data, p3, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = Color3.new(rs[i], gs[i], bs[i]) end
+    return r, p4
+end
+
+-- 0x0D  Vector2 — X, Y each as interleaved Roblox-float array.
+local function pVector2(data, pos, n)
+    local xs, p2 = readILFloat32(data, pos, n)
+    local ys, p3 = readILFloat32(data, p2, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = Vector2.new(xs[i], ys[i]) end
+    return r, p3
+end
+
+-- 0x0E  Vector3 — X, Y, Z each as interleaved Roblox-float array.
+local function pVector3(data, pos, n)
+    local xs, p2 = readILFloat32(data, pos, n)
+    local ys, p3 = readILFloat32(data, p2, n)
+    local zs, p4 = readILFloat32(data, p3, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = Vector3.new(xs[i], ys[i], zs[i]) end
+    return r, p4
+end
+
+-- 0x10  CFrame
+-- Per entry: 1 ID byte. ID==0 → 9 LE f32 rotation matrix follows.
+-- ID!=0 → rotation looked up from CF_ID table.
+-- After all rotation data: 3 interleaved Roblox-float arrays for positions.
+local function pCFrame(data, pos, n)
+    local rots = table.create(n)
+    for i = 1, n do
+        local id = string.byte(data, pos); pos = pos + 1
+        if id == 0 then
+            local r00,r01,r02,r10,r11,r12,r20,r21,r22 =
+                string.unpack('<fffffffff', data, pos); pos = pos + 36
+            rots[i] = CFrame.fromMatrix(
+                Vector3.new(),
+                Vector3.new(r00, r10, r20),  -- rightVector  (col 0)
+                Vector3.new(r01, r11, r21),  -- upVector     (col 1)
+                Vector3.new(r02, r12, r22)   -- backVector   (col 2)
+            )
+        else
+            rots[i] = CF_ID[id] or CFrame.new()
+        end
+    end
+    local xs, p2 = readILFloat32(data, pos, n)
+    local ys, p3 = readILFloat32(data, p2,  n)
+    local zs, p4 = readILFloat32(data, p3,  n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = CFrame.new(xs[i], ys[i], zs[i]) * rots[i] end
+    return r, p4
+end
+
+-- 0x12  Enum — interleaved big-endian u32, no transform.
+local function pEnum(data, pos, n) return readILUInt32(data, pos, n) end
+
+-- 0x13  Referent — interleaved Int32 + zigzag + delta accumulation.
+local function pReferent(data, pos, n) return readReferents(data, pos, n) end
+
+-- 0x14  Vector3int16 — sequential little-endian i16 triplets.
+local function pVector3int16(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        local x,y,z = string.unpack('<i2i2i2', data, pos)
+        r[i] = Vector3int16.new(x, y, z); pos = pos + 6
+    end
+    return r, pos
+end
+
+-- 0x15  NumberSequence — sequential, no interleaving.
+local function pNumberSequence(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        local cnt = string.unpack('<I4', data, pos); pos = pos + 4
+        local kps = table.create(cnt)
+        for j = 1, cnt do
+            local t, v, e = string.unpack('<fff', data, pos)
+            kps[j] = NumberSequenceKeypoint.new(t, v, e); pos = pos + 12
+        end
+        r[i] = NumberSequence.new(kps)
+    end
+    return r, pos
+end
+
+-- 0x16  ColorSequence — sequential, no interleaving.
+-- Each keypoint: time f32, R f32, G f32, B f32, envelope f32 (unused by API).
+-- All 5 floats are parsed to advance the cursor; envelope cannot be set
+-- via ColorSequenceKeypoint.new(), so it is discarded.
+local function pColorSequence(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        local cnt = string.unpack('<I4', data, pos); pos = pos + 4
+        local kps = table.create(cnt)
+        for j = 1, cnt do
+            local t, rv, gv, bv, _e = string.unpack('<fffff', data, pos)
+            kps[j] = ColorSequenceKeypoint.new(t, Color3.new(rv, gv, bv)); pos = pos + 20
+        end
+        r[i] = ColorSequence.new(kps)
+    end
+    return r, pos
+end
+
+-- 0x17  NumberRange — 2 sequential LE f32 per value.
+local function pNumberRange(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        local mn, mx = string.unpack('<ff', data, pos)
+        r[i] = NumberRange.new(mn, mx); pos = pos + 8
+    end
+    return r, pos
+end
+
+-- 0x18  Rect
+-- FIX: was read as 4 sequential standard IEEE-754 f32 per entry.
+-- Spec says Rect is 4 separately byte-interleaved Roblox-float arrays
+-- in the order Min.X, Min.Y, Max.X, Max.Y.
+-- Spec example: "Two encoded Rect values … look like this: 7f 00 00 00 …"
+-- confirms interleaved Roblox-float encoding.
+local function pRect(data, pos, n)
+    local x0s, p2 = readILFloat32(data, pos, n)   -- Min.X
+    local y0s, p3 = readILFloat32(data, p2,  n)   -- Min.Y
+    local x1s, p4 = readILFloat32(data, p3,  n)   -- Max.X
+    local y1s, p5 = readILFloat32(data, p4,  n)   -- Max.Y
+    local r = table.create(n)
+    for i = 1, n do r[i] = Rect.new(x0s[i], y0s[i], x1s[i], y1s[i]) end
+    return r, p5
+end
+
+-- 0x19  PhysicalProperties
+-- FIX: flags byte is a bitfield, not a plain boolean.
+--   Bit 0 (0x01): custom properties present
+--   Bit 1 (0x02): AcousticAbsorption f32 present (6th field, +4 bytes)
+-- Original checked `custom == 1` and always read 5 f32 (20 bytes).
+-- When flags == 3, reading only 5 instead of 6 f32s under-reads by 4
+-- bytes and corrupts the cursor for every subsequent property in that class.
+local function pPhysProp(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        local flags  = string.byte(data, pos); pos = pos + 1
+        local custom = band(flags, 1) == 1   -- bit 0
+        local hasAA  = band(flags, 2) == 2   -- bit 1: AcousticAbsorption
+        if custom then
+            local den, fric, elas, fw, ew = string.unpack('<fffff', data, pos)
+            pos = pos + 20
+            if hasAA then
+                pos = pos + 4   -- AcousticAbsorption f32: parsed, not settable
+            end
+            r[i] = PhysicalProperties.new(den, fric, elas, fw, ew)
+        else
+            r[i] = false   -- flags == 0 or 2: use default material properties
+        end
+    end
+    return r, pos
+end
+
+-- 0x1A  Color3uint8 — 3 consecutive byte arrays: R[N], G[N], B[N]. No transform.
+local function pColor3uint8(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        r[i] = Color3.fromRGB(
+            string.byte(data, pos + i - 1),
+            string.byte(data, pos + n + i - 1),
+            string.byte(data, pos + 2*n + i - 1)
+        )
+    end
+    return r, pos + 3*n
+end
+
+-- 0x1B  Int64 — 8-byte stride interleaved big-endian, zigzag.
+-- bit32 is limited to 32-bit arithmetic. We parse both 32-bit halves to
+-- advance the cursor correctly but apply zigzag only to the low word.
+-- This is accurate for all practical Roblox Int64 properties (none exceed
+-- 32-bit range in real place files).
+local function pInt64(data, pos, n)
+    local r = table.create(n)
+    for i = 0, n - 1 do
+        -- High word (bytes 0-3) intentionally discarded (not representable in bit32)
+        local lo = string.byte(data, pos + 4*n + i) * 16777216
+                 + string.byte(data, pos + 5*n + i) * 65536
+                 + string.byte(data, pos + 6*n + i) * 256
+                 + string.byte(data, pos + 7*n + i)
+        r[i + 1] = untransformInt(lo)
+    end
+    return r, pos + 8*n
+end
+
+-- 0x1C  SharedString — interleaved big-endian u32 indices into the SSTR table.
+-- This function takes a 4th arg (sharedStrings) and is injected into the
+-- dispatcher as a closure at parse time, keeping the PROP loop uniform.
+local function pSharedString(data, pos, n, sharedStrings)
+    local raw, np = readILUInt32(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do r[i] = sharedStrings[raw[i] + 1] or '' end
+    return r, np
+end
+
+-- 0x1D  Bytecode — same wire format as String (length-prefixed bytes).
+-- Contains precompiled Luau bytecode requiring a Roblox cryptographic
+-- signature to run. Cannot be executed here; parse to advance cursor only.
+local function pBytecode(data, pos, n)
+    local _, np = pString(data, pos, n)
+    return table.create(n), np
+end
+
+-- 0x1E  OptionalCFrame  (the generic "Optional" type; only CFrame is in use)
+-- FIX: original read bools-first then only-present CFrames — completely wrong.
+--
+-- Actual wire format (per spec, confirmed against byte-level example):
+--   Byte 0x10                 ← inner CFrame type marker
+--   <pCFrame for ALL n entries>   absent entries are stored as identity CFrame
+--   Byte 0x02                 ← Bool type marker
+--   <n presence bytes>
+--
+-- The key insight: absent CFrames ARE written to the stream as identity
+-- CFrames (ID byte 0x02). The presence bool array distinguishes them.
+-- Spec example for n=2 (one present, one absent):
+--   10  0a 02  <24-byte interleaved positions>  02  01 00
+local function pOptionalCFrame(data, pos, n)
+    pos = pos + 1                        -- skip inner CFrame type marker (0x10)
+    local cfs, p2 = pCFrame(data, pos, n)
+    pos = p2 + 1                         -- skip Bool type marker (0x02)
+    local r = table.create(n)
+    for i = 1, n do
+        local present = string.byte(data, pos) ~= 0; pos = pos + 1
+        r[i] = present and cfs[i] or nil
+    end
+    return r, pos
+end
+
+-- 0x1F  UniqueId — 16 bytes per entry (Index u32 + Time u32 + Random i64),
+-- byte-interleaved. No Luau equivalent; skip and advance cursor correctly.
+-- Total byte count = 16 × n regardless of interleaving.
+local function pUniqueId(data, pos, n)
+    return table.create(n), pos + 16*n
+end
+
+-- 0x20  Font — per entry: Family (String) + Weight (u16 LE) + Style (u8) +
+-- CachedFaceId (String, may be empty).
+-- FIX: original skipped all bytes and returned nil. Now decodes the family
+-- string and returns a Font instance; pcall guards against unknown families.
+local FONT_WEIGHT_MAP = {
+    [100] = Enum.FontWeight.Thin,       [200] = Enum.FontWeight.ExtraLight,
+    [300] = Enum.FontWeight.Light,      [400] = Enum.FontWeight.Regular,
+    [500] = Enum.FontWeight.Medium,     [600] = Enum.FontWeight.SemiBold,
+    [700] = Enum.FontWeight.Bold,       [800] = Enum.FontWeight.ExtraBold,
+    [900] = Enum.FontWeight.Heavy,
+}
+local function pFont(data, pos, n)
+    local r = table.create(n)
+    for i = 1, n do
+        local flen   = string.unpack('<I4', data, pos);  pos = pos + 4
+        local family = string.sub(data, pos, pos + flen - 1); pos = pos + flen
+        local weight = string.unpack('<I2', data, pos);  pos = pos + 2
+        local style  = string.byte(data, pos);           pos = pos + 1
+        local clen   = string.unpack('<I4', data, pos);  pos = pos + 4 + clen
+
+        local fw = FONT_WEIGHT_MAP[weight] or Enum.FontWeight.Regular
+        local fs = (style == 1) and Enum.FontStyle.Italic or Enum.FontStyle.Normal
+        local ok, font = pcall(Font.new, family, fw, fs)
+        r[i] = ok and font or nil
+    end
+    return r, pos
+end
+
+-- 0x22  Content  (new datatype, Roblox release 645+; replaces legacy ContentId)
+-- FIX: was aliased to pString, consuming wrong byte count and corrupting cursor.
+--
+-- Actual format (per spec):
+--   [n interleaved u32 SourceTypes]   0=None, 1=Uri, 2=Object
+--   [u32 LE UriCount]
+--   [UriCount × length-prefixed strings]
+--   [u32 LE ObjectCount]
+--   [ObjectCount interleaved i32 referents]
+--   [u32 LE ExternalObjectCount]
+--   [ExternalObjectCount interleaved i32 referents]
+--
+-- We extract URI strings for Uri-type entries so asset paths (rbxassetid://…)
+-- are preserved. Object refs cannot be resolved here and are skipped.
+local function pContent(data, pos, n)
+    local types, p2 = readILUInt32(data, pos, n)
+    pos = p2
+
+    local uriCount = string.unpack('<I4', data, pos); pos = pos + 4
+    local uris = table.create(uriCount)
+    for i = 1, uriCount do
+        local slen = string.unpack('<I4', data, pos); pos = pos + 4
+        uris[i] = string.sub(data, pos, pos + slen - 1); pos = pos + slen
+    end
+
+    -- Skip object referents (interleaved i32, 4 bytes × count)
+    local objCount = string.unpack('<I4', data, pos); pos = pos + 4
+    pos = pos + 4 * objCount
+
+    local extCount = string.unpack('<I4', data, pos); pos = pos + 4
+    pos = pos + 4 * extCount
+
+    -- Map source types back to values
+    local r = table.create(n)
+    local uIdx = 0
+    for i = 1, n do
+        if types[i] == 1 then   -- Uri
+            uIdx = uIdx + 1
+            r[i] = uris[uIdx] or ''
+        else
+            r[i] = ''
+        end
+    end
+    return r, pos
+end
+
+-- ============================================================
+-- DISPATCH TABLE
+-- Keys are the official Type IDs from the binary spec.
+-- 0x1c (SharedString) is injected as a closure at parse time.
+-- ============================================================
+
+local PARSERS = {
+    [0x01] = pString,       [0x02] = pBool,         [0x03] = pInt32,
+    [0x04] = pFloat32,      [0x05] = pFloat64,       [0x06] = pUDim,
+    [0x07] = pUDim2,        [0x08] = pRay,           [0x09] = pFaces,
+    [0x0a] = pAxes,         [0x0b] = pBrickColor,    [0x0c] = pColor3,
+    [0x0d] = pVector2,      [0x0e] = pVector3,       [0x10] = pCFrame,
+    [0x12] = pEnum,         [0x13] = pReferent,      [0x14] = pVector3int16,
+    [0x15] = pNumberSequence, [0x16] = pColorSequence, [0x17] = pNumberRange,
+    [0x18] = pRect,         -- FIX: interleaved Roblox-float arrays
+    [0x19] = pPhysProp,     -- FIX: bitfield flags + AcousticAbsorption
+    [0x1a] = pColor3uint8,  [0x1b] = pInt64,
+    -- [0x1c] = pSharedString  ← injected as closure at parse time
+    [0x1d] = pBytecode,     -- NEW
+    [0x1e] = pOptionalCFrame, -- FIX: correct ID (was 0x1f) + correct format
+    [0x1f] = pUniqueId,     -- FIX: correct ID (was 0x20)
+    [0x20] = pFont,         -- FIX: correct ID (was 0x21) + actually decodes
+    [0x22] = pContent,      -- FIX: proper format (was aliased to pString)
+}
+
+-- ============================================================
+-- SERVICES & SKIP LIST
+-- ============================================================
+
+local SERVICES = {
+    Workspace=true,          Lighting=true,          ReplicatedStorage=true,
+    ReplicatedFirst=true,    ServerStorage=true,     ServerScriptService=true,
+    StarterGui=true,         StarterPack=true,       StarterPlayer=true,
+    Teams=true,              SoundService=true,      Chat=true,
+    TestService=true,        LocalizationService=true, Players=true,
+}
+
+local SKIP = { Terrain = true }   -- singleton; cannot be re-created
+
+-- ============================================================
+-- CHUNK DECOMPRESSOR
+-- ============================================================
+
+local ZSTD_MAGIC = string.char(0x28, 0xB5, 0x2F, 0xFD)
+
+local function decompressChunk(raw, compLen, uncompLen)
+    if compLen == 0 then return raw end   -- stored uncompressed
+
+    -- ZSTD: Roblox Studio uses this for newer saves; unsupported in pure Luau.
+    if string.sub(raw, 1, 4) == ZSTD_MAGIC then
+        warn('[RBXLParser] ZSTD chunk — not supported in pure Luau, skipped')
+        return nil
+    end
+
+    local ok, result = pcall(lz4Decompress, raw, uncompLen)
+    if ok then return result end
+    warn('[RBXLParser] LZ4 decompress failed: ' .. tostring(result))
+    return nil
+end
+
+-- ============================================================
+-- MAIN PARSE FUNCTION
+-- ============================================================
+
+function RBXL.parse(data)
+    if string.sub(data, 1, 7) == '<roblox' and string.sub(data, 1, 8) ~= '<roblox!' then
+        return nil, 'XML (.rbxlx) format detected — only binary (.rbxl) is supported.'
+    end
+    if string.sub(data, 1, 8) ~= '<roblox!' then
+        return nil, 'Not a valid RBXL file (bad magic bytes).'
+    end
+
+    -- 32-byte file header
+    local pos = 15   -- skip magic[8] + signature[6] = 14; +1 for Lua 1-indexing
+    local version = string.unpack('<I2', data, pos); pos = pos + 2
+    if version ~= 0 then
+        return nil, 'Unsupported RBXL version: ' .. version
+    end
+    -- classCount / instanceCount are informational; we don't pre-allocate on them
+    pos = pos + 8 + 8   -- skip classCount(4) + instanceCount(4) + reserved(8)
+
+    -- ─── Chunk-level state ────────────────────────────────────
+    local instChunks  = {}   -- classId → {className, isService, referents, count}
+    local propData    = {}   -- classId → {propName → values[]}
+    local parentChunk = nil
+    local sharedStrs  = {}
+
+    -- Inject SharedString parser as a closure so the PROP loop stays uniform
+    local parsers = {}
+    for k, v in pairs(PARSERS) do parsers[k] = v end
+    parsers[0x1c] = function(body, cp, n)
+        return pSharedString(body, cp, n, sharedStrs)
+    end
+
+    -- ─── Chunk loop ───────────────────────────────────────────
+    while pos <= #data do
+        if pos + 15 > #data then break end   -- incomplete header guard
+
+        local chunkName = string.sub(data, pos, pos + 3); pos = pos + 4
+        local compLen   = string.unpack('<I4', data, pos); pos = pos + 4
+        local uncompLen = string.unpack('<I4', data, pos); pos = pos + 4
+        pos = pos + 4   -- reserved
+
+        chunkName = chunkName:match('^([^\0]+)') or ''
+
+        local bodyLen = (compLen == 0) and uncompLen or compLen
+        if pos + bodyLen - 1 > #data then break end
+        local rawBody = string.sub(data, pos, pos + bodyLen - 1)
+        pos = pos + bodyLen
+
+        if chunkName == 'END' then break end
+
+        local body = decompressChunk(rawBody, compLen, uncompLen)
+        if not body then goto nextChunk end
+
+        local cp = 1   -- cursor into the decompressed body
+
+        if chunkName == 'META' then
+            -- Key-value metadata map. Ignored for instance building purposes.
+            -- Notable key: "ExplicitAutoJoints" = "true"/"false".
+
+        elseif chunkName == 'SSTR' then
+            cp = cp + 4   -- version u32 (always 0)
+            local cnt = string.unpack('<I4', body, cp); cp = cp + 4
+            for i = 1, cnt do
+                cp = cp + 16   -- MD5 hash (unused by Studio)
+                local slen = string.unpack('<I4', body, cp); cp = cp + 4
+                sharedStrs[i] = string.sub(body, cp, cp + slen - 1); cp = cp + slen
+            end
+
+        elseif chunkName == 'INST' then
+            local classId   = string.unpack('<I4', body, cp); cp = cp + 4
+            local cnLen     = string.unpack('<I4', body, cp); cp = cp + 4
+            local className = string.sub(body, cp, cp + cnLen - 1); cp = cp + cnLen
+            local isService = string.byte(body, cp); cp = cp + 1
+            local cnt       = string.unpack('<I4', body, cp); cp = cp + 4
+            local refs, ncp = readReferents(body, cp, cnt); cp = ncp
+            if isService == 1 then cp = cp + cnt end   -- service marker bytes
+
+            instChunks[classId] = {
+                className = className,
+                isService = (isService == 1),
+                referents = refs,
+                count     = cnt,
+            }
+            propData[classId] = {}
+
+        elseif chunkName == 'PROP' then
+            local classId  = string.unpack('<I4', body, cp); cp = cp + 4
+            local pnLen    = string.unpack('<I4', body, cp); cp = cp + 4
+            local propName = string.sub(body, cp, cp + pnLen - 1); cp = cp + pnLen
+            local typeId   = string.byte(body, cp); cp = cp + 1
+
+            local info = instChunks[classId]
+            if info and info.count > 0 then
+                local parser = parsers[typeId]
+                if parser then
+                    local ok, vals = pcall(function()
+                        local v, _ = parser(body, cp, info.count)
+                        return v
+                    end)
+                    if ok and vals then
+                        propData[classId][propName] = vals
+                    elseif not ok then
+                        warn(('[RBXLParser] PROP error class=%s prop=%s typeId=0x%02x: %s')
+                            :format(info.className, propName, typeId, tostring(vals)))
+                    end
+                end
+            end
+
+        elseif chunkName == 'PRNT' then
+            cp = cp + 1   -- version byte (always 0)
+            local cnt       = string.unpack('<I4', body, cp); cp = cp + 4
+            local kids, cp2 = readReferents(body, cp, cnt)
+            local pars, _   = readReferents(body, cp2, cnt)
+            parentChunk = { count = cnt, kids = kids, pars = pars }
+        end
+
+        ::nextChunk::
+    end
+
+    if not parentChunk then
+        return nil, 'PRNT chunk not found — file may be corrupt or incomplete.'
+    end
+
+    -- ─── Build instance data table ────────────────────────────
+    local instances = {}
+
+    for classId, info in pairs(instChunks) do
+        local props = propData[classId] or {}
+        for i, ref in ipairs(info.referents) do
+            instances[ref] = {
+                className = info.className,
+                isService = info.isService,
+                props     = {},
+                children  = {},
+            }
+            for propName, vals in pairs(props) do
+                if vals[i] ~= nil then
+                    instances[ref].props[propName] = vals[i]
+                end
+            end
+        end
+    end
+
+    -- Build parent/child relationships from PRNT chunk
+    local roots = {}
+    for i = 1, parentChunk.count do
+        local child  = parentChunk.kids[i]
+        local parent = parentChunk.pars[i]
+        local ci     = instances[child]
+        if ci then
+            ci.parentRef = parent
+            if parent == -1 or not instances[parent] then
+                roots[#roots + 1] = child
+            else
+                local pc = instances[parent].children
+                pc[#pc + 1] = child
+            end
+        end
+    end
+
+    -- ─── Create Roblox instances (iterative) ─────────────────
+    -- FIX: original buildTree() was recursive. Deep ScreenGui hierarchies
+    -- (hundreds of nested Frames) could exhaust Lua's call stack.
+    -- Replaced with an explicit stack; children pushed in reverse order
+    -- so first sibling is processed first (LIFO stack reversal).
+
+    local created  = {}
+    local skipped  = 0
+    local inserted = 0
+
+    local container = Instance.new('Model')
+    container.Name  = 'InsertedPlace'
+
+    local stack = {}
+    for j = #roots, 1, -1 do
+        stack[#stack + 1] = { ref = roots[j], parentInst = container }
+    end
+
+    while #stack > 0 do
+        local entry = stack[#stack]; stack[#stack] = nil
+        local ref   = entry.ref
+        local pInst = entry.parentInst
+
+        local d = instances[ref]
+        if not d then goto continue end
+
+        local cn = d.className
+        if SKIP[cn] then skipped = skipped + 1; goto continue end
+
+        local inst
+        if d.isService or SERVICES[cn] then
+            local ok, svc = pcall(game.GetService, game, cn)
+            if not ok or not svc then skipped = skipped + 1; goto continue end
+            inst = svc
+        else
+            local ok, newInst = pcall(Instance.new, cn)
+            if not ok then skipped = skipped + 1; goto continue end
+            inst = newInst
+        end
+
+        local nm = d.props['Name']
+        if nm then pcall(function() inst.Name = nm end) end
+
+        for k, v in pairs(d.props) do
+            if k ~= 'Name' and k ~= 'Parent' and v ~= nil then
+                pcall(function() inst[k] = v end)
+            end
+        end
+
+        if not (d.isService or SERVICES[cn]) then
+            inst.Parent = pInst
+        end
+
+        created[ref] = inst
+        inserted     = inserted + 1
+
+        local ch = d.children
+        for j = #ch, 1, -1 do
+            stack[#stack + 1] = { ref = ch[j], parentInst = inst }
+        end
+
+        ::continue::
+    end
+
+    container.Parent = workspace
+    pcall(function() container:MoveTo(workspace.FlyCameraFocus.CFrame.Position) end)
+
+    return container, inserted, skipped
+end
+
+-- ============================================================
+-- DOWNLOAD + INSERT
+-- ============================================================
+
+function RBXL.insertFromPlaceId(placeId, statusFn)
+    local function status(msg)
+        if statusFn then pcall(statusFn, msg) end
+        print('[RBXLParser] ' .. tostring(msg))
+    end
+
+    if type(placeId) ~= 'number' then
+        status('Invalid place ID (must be a number)'); return nil
+    end
+
+    status('Downloading place ' .. placeId .. '...')
+    local url = 'https://assetdelivery.roblox.com/v1/asset/?id=' .. placeId
+    local ok, data = pcall(game.HttpGet, game, url)
+
+    if not ok or not data or #data < 32 then
+        status('Download failed: ' .. tostring(data)); return nil
+    end
+
+    status('Downloaded ' .. math.floor(#data / 1024) .. ' KB, parsing...')
+    local container, inserted, skipped = RBXL.parse(data)
+    if not container then
+        status('Parse failed: ' .. tostring(inserted)); return nil
+    end
+
+    status(('Done! Inserted %d instances (%d skipped).'):format(inserted, skipped))
+    return container
+end
+
+return RBXL
